@@ -1,0 +1,1024 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Porcupine</title>
+    <style>
+      html {
+  font-family: Helvetica, Arial, sans-serif;
+  font-size: 16px;
+}
+
+text {
+  dominant-baseline: middle;
+}
+
+#legend {
+  position: fixed;
+  left: 10px;
+  top: 10px;
+  background-color: rgba(255, 255, 255, 0.5);
+  backdrop-filter: blur(3px);
+  padding: 5px 2px 1px 2px;
+  border-radius: 4px;
+}
+
+#canvas {
+  margin-top: 45px;
+}
+
+#calc {
+  width: 0;
+  height: 0;
+  visibility: hidden;
+}
+
+.bg {
+  fill: transparent;
+}
+
+.divider {
+  stroke: #ccc;
+  stroke-width: 1;
+}
+
+.history-rect {
+  stroke: #888;
+  stroke-width: 1;
+  fill: #42d1f5;
+}
+
+.client-annotation-rect {
+  stroke: #888;
+  stroke-width: 1;
+  fill: #e0e0e0;
+}
+
+.link {
+  fill: #206475;
+  cursor: pointer;
+}
+
+.selected {
+  stroke-width: 5;
+}
+
+.target-rect {
+  opacity: 0;
+}
+
+.history-text {
+  font-size: 0.9rem;
+  font-family:
+    Menlo,
+    Courier New,
+    monospace;
+}
+
+.hidden {
+  opacity: 0.2;
+}
+
+.hidden line {
+  opacity: 0.5; /* note: this is multiplicative */
+}
+
+.linearization {
+  stroke: rgba(0, 0, 0, 0.5);
+}
+
+.linearization-invalid {
+  stroke: rgba(255, 0, 0, 0.5);
+}
+
+.linearization-point {
+  stroke-width: 5;
+}
+
+.linearization-line {
+  stroke-width: 2;
+}
+
+.tooltip {
+  position: absolute;
+  display: none;
+  width: max-content;
+  max-width: 300px;
+  border: 1px solid #ccc;
+  background: white;
+  border-radius: 4px;
+  padding: 5px;
+  font-size: 0.8rem;
+}
+
+.inactive {
+  display: none;
+}
+
+    </style>
+  </head>
+  <body>
+    <div id="legend">
+      <svg xmlns="http://www.w3.org/2000/svg" width="660" height="20">
+        <text x="0" y="10">Clients</text>
+        <line x1="50" y1="0" x2="70" y2="20" stroke="#000" stroke-width="1"></line>
+        <text x="70" y="10">Time</text>
+        <line x1="110" y1="10" x2="200" y2="10" stroke="#000" stroke-width="2"></line>
+        <polygon points="200,5 200,15, 210,10" fill="#000"></polygon>
+        <rect x="300" y="5" width="10" height="10" fill="rgba(0, 0, 0, 0.5)"></rect>
+        <text x="315" y="10">Valid LP</text>
+        <rect x="400" y="5" width="10" height="10" fill="rgba(255, 0, 0, 0.5)"></rect>
+        <text x="415" y="10">Invalid LP</text>
+        <text x="520" y="10" id="jump-link" class="link">[ jump to first error ]</text>
+      </svg>
+    </div>
+    <div id="canvas"></div>
+    <div id="calc"></div>
+    <script>
+      'use strict' // eslint-disable-line unicorn/prefer-module
+
+const SVG_NS = 'http://www.w3.org/2000/svg'
+
+function svgnew(tag, attributes) {
+  const element = document.createElementNS(SVG_NS, tag)
+  svgattr(element, attributes)
+  return element
+}
+
+function svgattr(element, attributes) {
+  if (attributes) {
+    for (const k in attributes) {
+      if (Object.hasOwn(attributes, k)) {
+        element.setAttributeNS(null, k, attributes[k])
+      }
+    }
+  }
+}
+
+function svgattach(parent, child) {
+  // eslint-disable-next-line unicorn/prefer-dom-node-append
+  return parent.appendChild(child)
+}
+
+function svgadd(element, tag, attributes) {
+  return svgattach(element, svgnew(tag, attributes))
+}
+
+function newArray(n, function_) {
+  const array = Array.from({length: n})
+  for (let i = 0; i < n; i++) {
+    array[i] = function_(i)
+  }
+
+  return array
+}
+
+function arrayEq(a, b) {
+  if (a === b) {
+    return true
+  }
+
+  if (a === undefined || a === null || b === undefined || b === null) {
+    return false
+  }
+
+  if (a.length !== b.length) {
+    return false
+  }
+
+  for (const [i, element] of a.entries()) {
+    if (element !== b[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+// eslint-disable-next-line no-unused-vars, complexity
+function render(data) {
+  const PADDING = 10
+  const BOX_HEIGHT = 30
+  const BOX_SPACE = 15
+  const EPSILON = 20
+  const LINE_BLEED = 5
+  const BOX_GAP = 20
+  const BOX_TEXT_PADDING = 10
+  const HISTORY_RECT_RADIUS = 4
+
+  const annotations = data.Annotations
+  const coreHistory = data.Partitions
+  // For simplicity, make annotations look like more history
+  const allData = [...coreHistory, {History: annotations}]
+
+  let maxClient = -1
+  for (const partition of allData) {
+    for (const element of partition.History) {
+      maxClient = Math.max(maxClient, element.ClientId)
+    }
+  }
+
+  // "real" clients, not including tags
+  const realClients = maxClient + 1
+  // We treat each unique annotation tag as another "client"
+  const tags = new Set()
+  for (const annot of annotations) {
+    const tag = annot.Tag
+    if (tag.length > 0) {
+      tags.add(tag)
+    }
+  }
+
+  // Add synthetic client numbers
+  const tag2ClientId = {}
+  const sortedTags = Array.from(tags).sort()
+  for (const tag of sortedTags) {
+    maxClient += 1
+    tag2ClientId[tag] = maxClient
+  }
+
+  for (const annot of annotations) {
+    const tag = annot.Tag
+    if (tag.length > 0) {
+      annot.ClientId = tag2ClientId[tag]
+    }
+  }
+
+  // Total number of clients now includes these synthetic clients
+  const nClient = maxClient + 1
+
+  // Prepare some useful data to be used later:
+  // - Add a GID to each event
+  // - Create a mapping from GIDs back to events
+  // - Create a set of all timestamps
+  // - Create a set of all start timestamps
+  const allTimestamps = new Set()
+  const startTimestamps = new Set()
+  const endTimestamps = new Set()
+  let gid = 0
+  const byGid = {}
+  for (const partition of allData) {
+    for (const element of partition.History) {
+      allTimestamps.add(element.Start)
+      startTimestamps.add(element.Start)
+      endTimestamps.add(element.End)
+      allTimestamps.add(element.End)
+      // Give elements GIDs
+      element.Gid = gid
+      byGid[gid] = element
+      gid++
+    }
+  }
+
+  let sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b)
+
+  // If one event has the same end time as another's start time, that means that
+  // they are concurrent, and we need to display them with overlap. We do this
+  // by tweaking the events that share the end time, updating the time to
+  // end+epsilon, so we have overlap.
+  //
+  // We do not render a good visualization in the situation where a single
+  // client has two events where one has an end time that matches the other's
+  // start time.  There isn't an easy way to handle this, because these two
+  // operations are concurrent (see the comment in model.go for more details for
+  // why it must be this way), and we can't display them with overlap on the
+  // same row cleanly.
+  const epsilon = 16
+  // Coordinated with computeVisualizationData, which uses an incrementing
+  // counter multiplied by 100, so it's safe to adjust timestamps by += epsilon
+  // without it overlapping with another adjusted timestamp (2*16 < 100)
+  for (const [index, partition] of allData.entries()) {
+    if (index === allData.length - 1) {
+      continue // Last partition is the annotations
+    }
+
+    for (const element of partition.History) {
+      const end = element.End
+      if (startTimestamps.has(end)) {
+        element.End = end + epsilon
+        allTimestamps.add(element.End)
+      }
+    }
+  }
+
+  // Handle display of (1) annotations where one has the same end time as
+  // another's start time, and (2) point-in-time annotations, on the same row.
+  //
+  // Unlike operations, where we interpret the start and end times as a closed
+  // interval (and where they have to be displayed with overlap, to be able to
+  // render linearizations and partial linearizations correctly), annotations
+  // are for display purposes only and we can interpret annotations with
+  // different start/end times as open intervals, and render two annotations
+  // with times (a, b) and (b, c) without overlap. We can also handle the
+  // situation where we have a point-in-time annotation with times (b, b).
+  //
+  // This code currently does not handle the case where we have two
+  // point-in-time annotations with the same tag at the same timestamp.
+  //
+  // We keep the annotation adjustment epsilon even smaller (dividing by 2), so
+  // adjusting an event's end time forward by epsilon doesn't overlap with an
+  // annotation's start time that's adjusted forwards (the adjustment of
+  // annotations goes in the opposite direction as that for events).
+  for (const element of allData.at(-1).History) {
+    if (element.End === element.Start) {
+      // Point-in-time annotation: we adjust these to have a non-zero-duration;
+      // we only need to edit the end timestamp, and we can leave the start
+      // as-is
+      element.End += epsilon / 4
+      allTimestamps.add(element.End)
+    } else {
+      // Annotation touching another event or annotation
+      if (startTimestamps.has(element.End)) {
+        element.End -= epsilon / 2
+        allTimestamps.add(element.End)
+      }
+
+      if (endTimestamps.has(element.Start)) {
+        element.Start += epsilon / 2
+        allTimestamps.add(element.Start)
+      }
+    }
+  }
+
+  // Update sortedTimestamps, because we created some new timestamps.
+  sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b)
+
+  // Compute layout.
+  //
+  // We warp time to make it easier to see what's going on. We can think
+  // of there being a monotonically increasing mapping from timestamps to
+  // x-positions. This mapping should satisfy some criteria to make the
+  // visualization interpretable:
+  //
+  // - distinguishability: there should be some minimum distance between
+  // unequal timestamps
+  // - visible text: history boxes should be wide enough to fit the text
+  // they contain
+  // - enough space for LPs: history boxes should be wide enough to fit
+  // all linearization points that go through them, while maintaining
+  // readability of linearizations (where each LP in a sequence is spaced
+  // some minimum distance away from the previous one)
+  //
+  // Originally, I thought about this as a linear program:
+  //
+  // - variables for every unique timestamp, x_i = warp(timestamp_i)
+  // - objective: minimize sum x_i
+  // - constraint: non-negative
+  // - constraint: ordering + distinguishability, timestamp_i < timestamp_j -> x_i + EPS < x_j
+  // - constraint: visible text, size_text_j < x_{timestamp_j_end} - x_{timestamp_j_start}
+  // - constraint: linearization lines have points that fit within box, ...
+  //
+  // This used to actually be implemented using an LP solver (without the
+  // linearization point part, though that should be doable too), but
+  // then I realized it's possible to solve optimally using a greedy
+  // left-to-right scan in linear time.
+  //
+  // So that is what we do here. We optimally solve the above, and while
+  // doing so, also compute some useful information (e.g. x-positions of
+  // linearization points) that is useful later.
+  const xPos = {}
+  // Compute some information about history elements, sorted by end time;
+  // the most important information here is box width.
+  const byEnd = allData
+    .flatMap((partition) =>
+      partition.History.map((element) => {
+        // Compute width of the text inside the history element by actually
+        // drawing it (in a hidden div)
+        const scratch = document.querySelector('#calc')
+        scratch.innerHTML = ''
+        const svg = svgadd(scratch, 'svg')
+        const text = svgadd(svg, 'text', {
+          'text-anchor': 'middle',
+          class: 'history-text',
+        })
+        text.textContent = element.Description
+        const bbox = text.getBBox()
+        const width = bbox.width + 2 * BOX_TEXT_PADDING
+        return {
+          start: element.Start,
+          end: element.End,
+          width,
+          gid: element.Gid,
+        }
+      })
+    )
+    .sort((a, b) => a.end - b.end)
+  // Some preprocessing for linearization points and illegal next
+  // linearizations. We need to figure out where exactly LPs end up
+  // as we go, so we can make sure event boxes are wide enough.
+  const eventToLinearizations = newArray(gid, () => []) // Event -> [{index, position}]
+  const eventIllegalLast = newArray(gid, () => []) // Event -> [index]
+  const allLinearizations = []
+  let lgid = 0
+  for (const partition of coreHistory) {
+    for (const lin of partition.PartialLinearizations) {
+      const globalized = [] // Linearization with global indexes instead of partition-local ones
+      const included = new Set() // For figuring out illegal next LPs
+      for (const [position, id] of lin.entries()) {
+        included.add(id.Index)
+        const gid = partition.History[id.Index].Gid
+        globalized.push(gid)
+        eventToLinearizations[gid].push({index: lgid, position})
+      }
+
+      allLinearizations.push(globalized)
+      let minEnd = Infinity
+      for (const [index, element] of partition.History.entries()) {
+        if (!included.has(index)) {
+          minEnd = Math.min(minEnd, element.End)
+        }
+      }
+
+      for (const [index, element] of partition.History.entries()) {
+        if (!included.has(index) && element.Start < minEnd) {
+          eventIllegalLast[element.Gid].push(lgid)
+        }
+      }
+
+      lgid++
+    }
+  }
+
+  const linearizationPositions = newArray(lgid, () => []) // [[xpos]]
+  // Okay, now we're ready to do the left-to-right scan.
+  // Solve timestamp -> xPos.
+  let eventIndex = 0
+  xPos[sortedTimestamps[0]] = 0 // Positions start at 0
+  for (let i = 1; i < sortedTimestamps.length; i++) {
+    // Left-to-right scan, finding minimum time we can use
+    const ts = sortedTimestamps[i]
+    // Ensure some gap from last timestamp
+    let pos = xPos[sortedTimestamps[i - 1]] + BOX_GAP
+    // Ensure that text fits in boxes
+    while (eventIndex < byEnd.length && byEnd[eventIndex].end <= ts) {
+      // Push our position as far as necessary to accommodate text in box
+      const event_ = byEnd[eventIndex]
+      const textEndPos = xPos[event_.start] + event_.width
+      pos = Math.max(pos, textEndPos)
+      // Ensure that LPs fit in box.
+      //
+      // When placing the end of an event, for all partial linearizations
+      // that include that event, for the prefix that comes before that event,
+      // all their start points must have been placed already, so we can figure
+      // out the minimum width that the box needs to be to accommodate the LP.
+      for (const li of eventToLinearizations[event_.gid].concat(
+        eventIllegalLast[event_.gid].map((index) => {
+          return {
+            index,
+            position: allLinearizations[index].length - 1,
+          }
+        })
+      )) {
+        const {index, position} = li
+        for (let i = linearizationPositions[index].length; i <= position; i++) {
+          // Determine past points
+          let previous = null
+          // eslint-disable-next-line max-depth
+          if (linearizationPositions[index].length > 0) {
+            previous = linearizationPositions[index][i - 1]
+          }
+
+          const nextGid = allLinearizations[index][i]
+          const nextPos =
+            previous === null
+              ? xPos[byGid[nextGid].Start]
+              : Math.max(xPos[byGid[nextGid].Start], previous + EPSILON)
+
+          linearizationPositions[index].push(nextPos)
+        }
+
+        // This next line only really makes sense for the ones in
+        // eventToLinearizations, not the ones from eventIllegalLast,
+        // but it's safe to do it for all points, so we don't bother to
+        // distinguish.
+        pos = Math.max(pos, linearizationPositions[index][position])
+      }
+
+      // Ensure that illegal next LPs fit in box too
+      for (const li of eventIllegalLast[event_.gid]) {
+        const lin = linearizationPositions[li]
+        const previous = lin.at(-1)
+        pos = Math.max(pos, previous + EPSILON)
+      }
+
+      eventIndex++
+    }
+
+    xPos[ts] = pos
+  }
+
+  // Get maximum tag width
+  let maxTagWidth = 0
+  for (let i = 0; i < nClient; i++) {
+    const tag = i < realClients ? i.toString() : sortedTags[i - realClients]
+    const scratch = document.querySelector('#calc')
+    scratch.innerHTML = ''
+    const svg = svgadd(scratch, 'svg')
+    const text = svgadd(svg, 'text', {
+      'text-anchor': 'end',
+    })
+    text.textContent = tag
+    const bbox = text.getBBox()
+    const width = bbox.width + 2 * BOX_TEXT_PADDING
+    if (width > maxTagWidth) {
+      maxTagWidth = width
+    }
+  }
+
+  const t0x = PADDING + maxTagWidth // X-pos of line at t=0
+
+  // Solved, now draw UI.
+
+  let selected = false
+  let selectedIndex = [-1, -1]
+
+  const height = 2 * PADDING + BOX_HEIGHT * nClient + BOX_SPACE * (nClient - 1)
+  const width = 2 * PADDING + maxTagWidth + xPos[sortedTimestamps.at(-1)]
+  const svg = svgadd(document.querySelector('#canvas'), 'svg', {
+    width,
+    height,
+  })
+
+  // Draw background, etc.
+  const bg = svgadd(svg, 'g')
+  const bgRect = svgadd(bg, 'rect', {
+    height,
+    width,
+    x: 0,
+    y: 0,
+    class: 'bg',
+  })
+  bgRect.addEventListener('click', handleBgClick)
+  for (let i = 0; i < nClient; i++) {
+    const text = svgadd(bg, 'text', {
+      x: PADDING + maxTagWidth - BOX_TEXT_PADDING,
+      y: PADDING + BOX_HEIGHT / 2 + i * (BOX_HEIGHT + BOX_SPACE),
+      'text-anchor': 'end',
+    })
+    text.textContent = i < realClients ? i : sortedTags[i - realClients]
+  }
+
+  // Vertical line at t=0
+  svgadd(bg, 'line', {
+    x1: t0x,
+    y1: PADDING,
+    x2: t0x,
+    y2: height - PADDING,
+    class: 'divider',
+  })
+  // Horizontal line dividing clients from annotation tags, but only if there are tags
+  if (tags.size > 0) {
+    const annotationLineY = PADDING + realClients * (BOX_HEIGHT + BOX_SPACE) - BOX_SPACE / 2
+    svgadd(bg, 'line', {
+      x1: PADDING,
+      y1: annotationLineY,
+      x2: t0x,
+      y2: annotationLineY,
+      class: 'divider',
+    })
+  }
+
+  // Draw history
+  const historyLayers = []
+  const historyRects = []
+  const targetRects = svgnew('g')
+  for (const [partitionIndex, partition] of allData.entries()) {
+    const l = svgadd(svg, 'g')
+    historyLayers.push(l)
+    const rects = []
+    for (const [elementIndex, element] of partition.History.entries()) {
+      const g = svgadd(l, 'g')
+      const rx = xPos[element.Start]
+      const width = xPos[element.End] - rx
+      const x = rx + t0x
+      const y = PADDING + element.ClientId * (BOX_HEIGHT + BOX_SPACE)
+      const rectClass = element.Annotation ? 'client-annotation-rect' : 'history-rect'
+      rects.push(
+        svgadd(g, 'rect', {
+          height: BOX_HEIGHT,
+          width,
+          x,
+          y,
+          rx: HISTORY_RECT_RADIUS,
+          ry: HISTORY_RECT_RADIUS,
+          class: rectClass,
+          style:
+            element.Annotation && element.BackgroundColor.length > 0
+              ? `fill: ${element.BackgroundColor};`
+              : '',
+        })
+      )
+      const text = svgadd(g, 'text', {
+        x: x + width / 2,
+        y: y + BOX_HEIGHT / 2,
+        'text-anchor': 'middle',
+        class: 'history-text',
+        style:
+          element.Annotation && element.TextColor.length > 0 ? `fill: ${element.TextColor};` : '',
+      })
+      text.textContent = element.Description
+      // We don't add mouseTarget to g, but to targetRects, because we
+      // want to layer this on top of everything at the end; otherwise, the
+      // LPs and lines will be over the target, which will create holes
+      // where hover etc. won't work
+      const mouseTarget = svgadd(targetRects, 'rect', {
+        height: BOX_HEIGHT,
+        width,
+        x,
+        y,
+        class: 'target-rect',
+        'data-partition': partitionIndex,
+        'data-index': elementIndex,
+      })
+      mouseTarget.addEventListener('mouseover', handleMouseOver)
+      mouseTarget.addEventListener('mousemove', handleMouseMove)
+      mouseTarget.addEventListener('mouseout', handleMouseOut)
+      mouseTarget.addEventListener('click', handleClick)
+    }
+
+    historyRects.push(rects)
+  }
+
+  // Draw partial linearizations
+  const illegalLast = coreHistory.map((partition) => {
+    return partition.PartialLinearizations.map(() => new Set())
+  })
+  const largestIllegal = coreHistory.map(() => {
+    return {}
+  })
+  const largestIllegalLength = coreHistory.map(() => {
+    return {}
+  })
+  const partialLayers = []
+  const errorPoints = []
+  for (const [partitionIndex, partition] of coreHistory.entries()) {
+    const l = []
+    partialLayers.push(l)
+    for (const [linIndex, lin] of partition.PartialLinearizations.entries()) {
+      const g = svgadd(svg, 'g')
+      l.push(g)
+      let previousX = null
+      let previousY = null
+      let previousElement = null
+      const included = new Set()
+      for (const id of lin) {
+        const element = partition.History[id.Index]
+        const hereX = t0x + xPos[element.Start]
+        const x = previousX === null ? hereX : Math.max(hereX, previousX + EPSILON)
+        const y = PADDING + element.ClientId * (BOX_HEIGHT + BOX_SPACE) - LINE_BLEED
+        // Line from previous
+        if (previousElement !== null) {
+          svgadd(g, 'line', {
+            x1: previousX,
+            x2: x,
+            y1:
+              previousElement.ClientId >= element.ClientId
+                ? previousY
+                : previousY + BOX_HEIGHT + 2 * LINE_BLEED,
+            y2: previousElement.ClientId <= element.ClientId ? y : y + BOX_HEIGHT + 2 * LINE_BLEED,
+            class: 'linearization linearization-line',
+          })
+        }
+
+        // Current line
+        svgadd(g, 'line', {
+          x1: x,
+          x2: x,
+          y1: y,
+          y2: y + BOX_HEIGHT + 2 * LINE_BLEED,
+          class: 'linearization linearization-point',
+        })
+        previousX = x
+        previousY = y
+        previousElement = element
+        included.add(id.Index)
+      }
+
+      // Show possible but illegal next linearizations
+      // a history element is a possible next try
+      // if no other history element must be linearized earlier
+      // i.e. forall others, this.start < other.end
+      let minEnd = Infinity
+      for (const [index, element] of partition.History.entries()) {
+        if (!included.has(index)) {
+          minEnd = Math.min(minEnd, element.End)
+        }
+      }
+
+      for (const [index, element] of partition.History.entries()) {
+        if (!included.has(index) && element.Start < minEnd) {
+          const hereX = t0x + xPos[element.Start]
+          const x = previousX === null ? hereX : Math.max(hereX, previousX + EPSILON)
+          const y = PADDING + element.ClientId * (BOX_HEIGHT + BOX_SPACE) - LINE_BLEED
+          // Line from previous
+          svgadd(g, 'line', {
+            x1: previousX,
+            x2: x,
+            y1:
+              previousElement.ClientId >= element.ClientId
+                ? previousY
+                : previousY + BOX_HEIGHT + 2 * LINE_BLEED,
+            y2: previousElement.ClientId <= element.ClientId ? y : y + BOX_HEIGHT + 2 * LINE_BLEED,
+            class: 'linearization-invalid linearization-line',
+          })
+          // Current line
+          const point = svgadd(g, 'line', {
+            x1: x,
+            x2: x,
+            y1: y,
+            y2: y + BOX_HEIGHT + 2 * LINE_BLEED,
+            class: 'linearization-invalid linearization-point',
+          })
+          errorPoints.push({
+            x,
+            partition: partitionIndex,
+            index: lin.at(-1).Index, // NOTE not index
+            element: point,
+          })
+          illegalLast[partitionIndex][linIndex].add(index)
+          // eslint-disable-next-line max-depth
+          if (
+            !Object.hasOwn(largestIllegalLength[partitionIndex], index) ||
+            largestIllegalLength[partitionIndex][index] < lin.length
+          ) {
+            largestIllegalLength[partitionIndex][index] = lin.length
+            largestIllegal[partitionIndex][index] = linIndex
+          }
+        }
+      }
+    }
+  }
+
+  errorPoints.sort((a, b) => a.x - b.x)
+
+  // Attach targetRects
+  svgattach(svg, targetRects)
+
+  // Tooltip
+  // eslint-disable-next-line unicorn/prefer-dom-node-append
+  const tooltip = document.querySelector('#canvas').appendChild(document.createElement('div'))
+  tooltip.setAttribute('class', 'tooltip')
+
+  function handleMouseOver() {
+    if (!selected) {
+      const partition = Number.parseInt(this.dataset.partition, 10)
+      const index = Number.parseInt(this.dataset.index, 10)
+      highlight(partition, index)
+      tooltip.style.display = 'block'
+    }
+  }
+
+  function linearizationIndex(partition, index) {
+    // Show this linearization
+    if (partition >= coreHistory.length) {
+      // Annotation
+      return null
+    }
+
+    if (Object.hasOwn(coreHistory[partition].Largest, index)) {
+      return coreHistory[partition].Largest[index]
+    }
+
+    if (Object.hasOwn(largestIllegal[partition], index)) {
+      return largestIllegal[partition][index]
+    }
+
+    return null
+  }
+
+  function highlight(partition, index) {
+    // Hide all but this partition
+    for (const [i, layer] of historyLayers.entries()) {
+      if (i === partition) {
+        layer.classList.remove('hidden')
+      } else {
+        layer.classList.add('hidden')
+      }
+    }
+
+    // Hide all but the relevant linearization
+    for (const layer of partialLayers) {
+      for (const g of layer) {
+        g.classList.add('hidden')
+      }
+    }
+
+    // Show this linearization
+    const maxIndex = linearizationIndex(partition, index)
+    if (maxIndex !== null) {
+      partialLayers[partition][maxIndex].classList.remove('hidden')
+    }
+
+    updateJump()
+  }
+
+  let lastTooltip = [null, null, null, null, null]
+  function handleMouseMove(event_) {
+    // Keep tooltip static if selected
+    if (selected) {
+      return
+    }
+
+    const partition = Number.parseInt(this.dataset.partition, 10)
+    const index = Number.parseInt(this.dataset.index, 10)
+    const [sPartition, sIndex] = selectedIndex
+    const thisTooltip = [partition, index, selected, sPartition, sIndex]
+
+    if (!arrayEq(lastTooltip, thisTooltip)) {
+      // If selected, show info relevant to the selected linearization
+      const maxIndex = selected
+        ? linearizationIndex(sPartition, sIndex)
+        : linearizationIndex(partition, index)
+
+      if (partition >= coreHistory.length) {
+        // Annotation
+        const details = annotations[index].Details
+        tooltip.innerHTML = details.length === 0 ? '&langle;no details&rangle;' : details
+      } else if (selected && sPartition !== partition) {
+        tooltip.innerHTML = 'Not part of selected partition.'
+      } else if (maxIndex === null) {
+        tooltip.innerHTML = selected
+          ? 'Selected element is not part of any partial linearization.'
+          : 'Not part of any partial linearization.'
+      } else {
+        const lin = coreHistory[partition].PartialLinearizations[maxIndex]
+        let previous = null
+        let current = null
+        let found = false
+        for (const element of lin) {
+          previous = current
+          current = element
+          if (current.Index === index) {
+            found = true
+            break
+          }
+        }
+
+        const callTime = allData[partition].History[index].OriginalStart
+        const returnTime = allData[partition].History[index].OriginalEnd
+        let message = ''
+        if (found) {
+          // Part of linearization
+          if (previous !== null) {
+            message =
+              '<strong>Previous state:</strong><br>' + previous.StateDescription + '<br><br>'
+          }
+
+          message +=
+            '<strong>New state:</strong><br>' +
+            current.StateDescription +
+            '<br><br>Call: ' +
+            callTime +
+            '<br><br>Return: ' +
+            returnTime
+        } else if (illegalLast[partition][maxIndex].has(index)) {
+          // Illegal next one
+          message =
+            '<strong>Previous state:</strong><br>' +
+            lin.at(-1).StateDescription +
+            '<br><br><strong>New state:</strong><br>&langle;invalid op&rangle;' +
+            '<br><br>Call: ' +
+            callTime +
+            '<br><br>Return: ' +
+            returnTime
+        } else {
+          // Not part of this one
+          message = "Not part of selected element's partial linearization."
+        }
+
+        tooltip.innerHTML = message
+      }
+
+      lastTooltip = thisTooltip
+    }
+
+    // Make sure tooltip doesn't overflow off the right side of the screen
+    const maxX =
+      document.documentElement.scrollLeft +
+      document.documentElement.clientWidth -
+      PADDING -
+      tooltip.getBoundingClientRect().width
+    tooltip.style.left = Math.min(event_.pageX + 20, maxX) + 'px'
+    tooltip.style.top = event_.pageY + 20 + 'px'
+  }
+
+  function handleMouseOut() {
+    if (!selected) {
+      resetHighlight()
+      tooltip.style.display = 'none'
+      lastTooltip = [null, null, null, null, null]
+    }
+  }
+
+  function resetHighlight() {
+    // Show all layers
+    for (const layer of historyLayers) {
+      layer.classList.remove('hidden')
+    }
+
+    // Show longest linearizations, which are first
+    for (const layers of partialLayers) {
+      for (const [i, l] of layers.entries()) {
+        if (i === 0) {
+          l.classList.remove('hidden')
+        } else {
+          l.classList.add('hidden')
+        }
+      }
+    }
+
+    updateJump()
+  }
+
+  // Store jump click handler so we can remove it before adding a new one
+  let jumpClickHandler = null
+
+  function updateJump() {
+    const jump = document.querySelector('#jump-link')
+    // Find first non-hidden point
+    // feels a little hacky, but it works
+    const point = errorPoints.find((pt) => !pt.element.parentElement.classList.contains('hidden'))
+
+    // Remove any existing event listener
+    if (jumpClickHandler) {
+      jump.removeEventListener('click', jumpClickHandler)
+      jumpClickHandler = null
+    }
+
+    if (point) {
+      jump.classList.remove('inactive')
+      jumpClickHandler = () => {
+        point.element.scrollIntoView({behavior: 'smooth', inline: 'center', block: 'center'})
+        if (!selected) {
+          select(point.partition, point.index)
+        }
+      }
+
+      jump.addEventListener('click', jumpClickHandler)
+    } else {
+      jump.classList.add('inactive')
+    }
+  }
+
+  function handleClick(event_) {
+    const partition = Number.parseInt(this.dataset.partition, 10)
+    const index = Number.parseInt(this.dataset.index, 10)
+    if (selected) {
+      const [sPartition, sIndex] = selectedIndex
+      if (partition === sPartition && index === sIndex) {
+        deselect()
+        // Note: we're still displaying the tooltip, but once the user's mouse moves, it'll get updated
+        return
+      }
+
+      historyRects[sPartition][sIndex].classList.remove('selected')
+    }
+
+    select(partition, index)
+
+    tooltip.style.display = 'block'
+    // Set static tooltip position when selecting
+    const maxX =
+      document.documentElement.scrollLeft +
+      document.documentElement.clientWidth -
+      PADDING -
+      tooltip.getBoundingClientRect().width
+    tooltip.style.left = Math.min(event_.pageX + 20, maxX) + 'px'
+    tooltip.style.top = event_.pageY + 20 + 'px'
+  }
+
+  function handleBgClick() {
+    deselect()
+
+    tooltip.style.display = 'none'
+    lastTooltip = [null, null, null, null, null]
+  }
+
+  function select(partition, index) {
+    selected = true
+    selectedIndex = [partition, index]
+    highlight(partition, index)
+    historyRects[partition][index].classList.add('selected')
+  }
+
+  function deselect() {
+    if (!selected) {
+      return
+    }
+
+    selected = false
+    resetHighlight()
+    const [partition, index] = selectedIndex
+    historyRects[partition][index].classList.remove('selected')
+  }
+
+  handleMouseOut() // Initialize, same as mouse out
+}
+
+
+      const data = {"Partitions":[{"History":[{"ClientId":0,"Start":0,"OriginalStart":"4498","End":100,"OriginalEnd":"11150","Description":"PUT \u003c(\"k1\"), (\"elder\")\u003e"},{"ClientId":0,"Start":200,"OriginalStart":"12150","End":1200,"OriginalEnd":"31052","Description":"GET (\"k1\")→\"elder\""},{"ClientId":1,"Start":300,"OriginalStart":"13578","End":500,"OriginalEnd":"19783","Description":"GET (\"k2\")→\"NotFound\""},{"ClientId":2,"Start":400,"OriginalStart":"19502","End":800,"OriginalEnd":"23358","Description":"GET (\"k3\")→\"NotFound\""},{"ClientId":1,"Start":600,"OriginalStart":"20783","End":1800,"OriginalEnd":"41251","Description":"PUT \u003c(\"k2\"), (\"kiwi\")\u003e"},{"ClientId":3,"Start":700,"OriginalStart":"22326","End":1000,"OriginalEnd":"29594","Description":"GET (\"k4\")→\"NotFound\""},{"ClientId":2,"Start":900,"OriginalStart":"24358","End":2100,"OriginalEnd":"44010","Description":"PUT \u003c(\"k3\"), (\"olive\")\u003e"},{"ClientId":3,"Start":1100,"OriginalStart":"30168","End":2800,"OriginalEnd":"50125","Description":"PUT \u003c(\"k4\"), (\"mango\")\u003e"},{"ClientId":0,"Start":1300,"OriginalStart":"32052","End":3100,"OriginalEnd":"55522","Description":"GET (\"k1\")→\"elder\""},{"ClientId":4,"Start":1400,"OriginalStart":"32168","End":1500,"OriginalEnd":"36670","Description":"GET (\"k5\")→\"NotFound\""},{"ClientId":4,"Start":1600,"OriginalStart":"37670","End":3400,"OriginalEnd":"60065","Description":"PUT \u003c(\"k5\"), (\"elder\")\u003e"},{"ClientId":5,"Start":1700,"OriginalStart":"40245","End":2300,"OriginalEnd":"46896","Description":"GET (\"k6\")→\"NotFound\""},{"ClientId":1,"Start":1900,"OriginalStart":"41952","End":2400,"OriginalEnd":"47721","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":6,"Start":2000,"OriginalStart":"42251","End":4200,"OriginalEnd":"73384","Description":"PUT \u003c(\"k2\"), (\"olive\")\u003e"},{"ClientId":2,"Start":2200,"OriginalStart":"45010","End":3700,"OriginalEnd":"66200","Description":"GET (\"k3\")→\"olive\""},{"ClientId":1,"Start":2500,"OriginalStart":"47896","End":3600,"OriginalEnd":"65969","Description":"PUT \u003c(\"k6\"), (\"cherry\")\u003e"},{"ClientId":5,"Start":2600,"OriginalStart":"48721","End":4000,"OriginalEnd":"71113","Description":"PUT \u003c(\"k7\"), (\"nectar\")\u003e"},{"ClientId":7,"Start":2700,"OriginalStart":"49935","End":3000,"OriginalEnd":"54875","Description":"PUT \u003c(\"k8\"), (\"grape\")\u003e"},{"ClientId":3,"Start":2900,"OriginalStart":"51125","End":4800,"OriginalEnd":"79144","Description":"GET (\"k4\")→\"mango\""},{"ClientId":0,"Start":3200,"OriginalStart":"55917","End":4600,"OriginalEnd":"76442","Description":"PUT \u003c(\"k8\"), (\"olive\")\u003e"},{"ClientId":7,"Start":3300,"OriginalStart":"56522","End":4400,"OriginalEnd":"75342","Description":"DELETE \u003c(\"k1\"), (\"\")\u003e"},{"ClientId":4,"Start":3500,"OriginalStart":"61065","End":5200,"OriginalEnd":"87620","Description":"PUT \u003c(\"k5\"), (\"apple\")\u003e"},{"ClientId":1,"Start":3800,"OriginalStart":"66969","End":6200,"OriginalEnd":"97080","Description":"DELETE \u003c(\"k6\"), (\"\")\u003e"},{"ClientId":2,"Start":3900,"OriginalStart":"67200","End":5400,"OriginalEnd":"89017","Description":"PUT \u003c(\"k3\"), (\"peach\")\u003e"},{"ClientId":5,"Start":4100,"OriginalStart":"72113","End":6000,"OriginalEnd":"95659","Description":"DELETE \u003c(\"k7\"), (\"\")\u003e"},{"ClientId":6,"Start":4300,"OriginalStart":"74384","End":5600,"OriginalEnd":"92533","Description":"GET (\"k2\")→\"olive\""},{"ClientId":7,"Start":4500,"OriginalStart":"76342","End":5000,"OriginalEnd":"81178","Description":"PUT \u003c(\"k1\"), (\"banana\")\u003e"},{"ClientId":0,"Start":4700,"OriginalStart":"77442","End":6900,"OriginalEnd":"105554","Description":"PUT \u003c(\"k8\"), (\"peach\")\u003e"},{"ClientId":3,"Start":4900,"OriginalStart":"80144","End":6500,"OriginalEnd":"100093","Description":"GET (\"k4\")→\"mango\""},{"ClientId":7,"Start":5100,"OriginalStart":"82178","End":6800,"OriginalEnd":"105350","Description":"DELETE \u003c(\"k1\"), (\"\")\u003e"},{"ClientId":4,"Start":5300,"OriginalStart":"88620","End":7400,"OriginalEnd":"111769","Description":"PUT \u003c(\"k5\"), (\"jam\")\u003e"},{"ClientId":2,"Start":5500,"OriginalStart":"90017","End":5800,"OriginalEnd":"94032","Description":"GET (\"k3\")→\"peach\""},{"ClientId":6,"Start":5700,"OriginalStart":"93533","End":6400,"OriginalEnd":"100068","Description":"GET (\"k2\")→\"olive\""},{"ClientId":2,"Start":5900,"OriginalStart":"95032","End":8400,"OriginalEnd":"119659","Description":"PUT \u003c(\"k3\"), (\"elder\")\u003e"},{"ClientId":5,"Start":6100,"OriginalStart":"96659","End":7900,"OriginalEnd":"115185","Description":"PUT \u003c(\"k7\"), (\"lemon\")\u003e"},{"ClientId":1,"Start":6300,"OriginalStart":"98080","End":7800,"OriginalEnd":"114703","Description":"PUT \u003c(\"k6\"), (\"mango\")\u003e"},{"ClientId":3,"Start":6600,"OriginalStart":"101068","End":9200,"OriginalEnd":"126460","Description":"GET (\"k2\")→\"olive\""},{"ClientId":6,"Start":6700,"OriginalStart":"101093","End":7200,"OriginalEnd":"106569","Description":"PUT \u003c(\"k4\"), (\"mango\")\u003e"},{"ClientId":0,"Start":7000,"OriginalStart":"106350","End":7500,"OriginalEnd":"112316","Description":"PUT \u003c(\"k1\"), (\"cherry\")\u003e"},{"ClientId":7,"Start":7100,"OriginalStart":"106554","End":9400,"OriginalEnd":"129513","Description":"PUT \u003c(\"k8\"), (\"ham\")\u003e"},{"ClientId":6,"Start":7300,"OriginalStart":"107569","End":10200,"OriginalEnd":"136429","Description":"GET (\"k4\")→\"mango\""},{"ClientId":0,"Start":7600,"OriginalStart":"112769","End":8200,"OriginalEnd":"119087","Description":"DELETE \u003c(\"k5\"), (\"\")\u003e"},{"ClientId":4,"Start":7700,"OriginalStart":"113316","End":9600,"OriginalEnd":"132701","Description":"GET (\"k1\")→\"cherry\""},{"ClientId":1,"Start":8000,"OriginalStart":"115703","End":8300,"OriginalEnd":"119579","Description":"PUT \u003c(\"k6\"), (\"grape\")\u003e"},{"ClientId":5,"Start":8100,"OriginalStart":"116185","End":8600,"OriginalEnd":"120397","Description":"DELETE \u003c(\"k7\"), (\"\")\u003e"},{"ClientId":0,"Start":8500,"OriginalStart":"120087","End":11000,"OriginalEnd":"146225","Description":"GET (\"k5\")→\"NotFound\""},{"ClientId":1,"Start":8700,"OriginalStart":"120579","End":10600,"OriginalEnd":"143340","Description":"PUT \u003c(\"k6\"), (\"fig\")\u003e"},{"ClientId":2,"Start":8800,"OriginalStart":"120659","End":9000,"OriginalEnd":"124684","Description":"PUT \u003c(\"k3\"), (\"mango\")\u003e"},{"ClientId":5,"Start":8900,"OriginalStart":"121397","End":10900,"OriginalEnd":"146020","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":2,"Start":9100,"OriginalStart":"125684","End":10800,"OriginalEnd":"145385","Description":"GET (\"k3\")→\"mango\""},{"ClientId":3,"Start":9300,"OriginalStart":"127460","End":9800,"OriginalEnd":"133995","Description":"PUT \u003c(\"k2\"), (\"cherry\")\u003e"},{"ClientId":7,"Start":9500,"OriginalStart":"130513","End":9900,"OriginalEnd":"134305","Description":"PUT \u003c(\"k8\"), (\"ice\")\u003e"},{"ClientId":4,"Start":9700,"OriginalStart":"133701","End":12300,"OriginalEnd":"160001","Description":"GET (\"k1\")→\"cherry\""},{"ClientId":3,"Start":10000,"OriginalStart":"134995","End":11600,"OriginalEnd":"151509","Description":"PUT \u003c(\"k2\"), (\"peach\")\u003e"},{"ClientId":7,"Start":10100,"OriginalStart":"135305","End":12600,"OriginalEnd":"163621","Description":"DELETE \u003c(\"k8\"), (\"\")\u003e"},{"ClientId":6,"Start":10300,"OriginalStart":"137429","End":10400,"OriginalEnd":"141793","Description":"GET (\"k4\")→\"mango\""},{"ClientId":6,"Start":10500,"OriginalStart":"142793","End":12200,"OriginalEnd":"159801","Description":"GET (\"k4\")→\"mango\""},{"ClientId":1,"Start":10700,"OriginalStart":"144340","End":11500,"OriginalEnd":"151365","Description":"GET (\"k6\")→\"fig\""},{"ClientId":0,"Start":11100,"OriginalStart":"146385","End":13600,"OriginalEnd":"177535","Description":"DELETE \u003c(\"k3\"), (\"\")\u003e"},{"ClientId":2,"Start":11200,"OriginalStart":"147020","End":12000,"OriginalEnd":"153283","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":5,"Start":11300,"OriginalStart":"147225","End":11400,"OriginalEnd":"151232","Description":"GET (\"k5\")→\"NotFound\""},{"ClientId":1,"Start":11700,"OriginalStart":"152232","End":12900,"OriginalEnd":"171086","Description":"PUT \u003c(\"k5\"), (\"lemon\")\u003e"},{"ClientId":3,"Start":11800,"OriginalStart":"152365","End":12800,"OriginalEnd":"170711","Description":"PUT \u003c(\"k6\"), (\"cherry\")\u003e"},{"ClientId":5,"Start":11900,"OriginalStart":"152509","End":13800,"OriginalEnd":"178906","Description":"DELETE \u003c(\"k2\"), (\"\")\u003e"},{"ClientId":2,"Start":12100,"OriginalStart":"154283","End":13400,"OriginalEnd":"174214","Description":"PUT \u003c(\"k7\"), (\"elder\")\u003e"},{"ClientId":4,"Start":12400,"OriginalStart":"160801","End":14300,"OriginalEnd":"187930","Description":"GET (\"k4\")→\"mango\""},{"ClientId":6,"Start":12500,"OriginalStart":"161001","End":14000,"OriginalEnd":"182160","Description":"GET (\"k1\")→\"cherry\""},{"ClientId":7,"Start":12700,"OriginalStart":"164621","End":13000,"OriginalEnd":"171208","Description":"GET (\"k8\")→\"NotFound\""},{"ClientId":1,"Start":13100,"OriginalStart":"171711","End":14900,"OriginalEnd":"196593","Description":"DELETE \u003c(\"k6\"), (\"\")\u003e"},{"ClientId":3,"Start":13200,"OriginalStart":"172086","End":14800,"OriginalEnd":"195999","Description":"DELETE \u003c(\"k5\"), (\"\")\u003e"},{"ClientId":7,"Start":13300,"OriginalStart":"172208","End":14600,"OriginalEnd":"189785","Description":"PUT \u003c(\"k8\"), (\"olive\")\u003e"},{"ClientId":2,"Start":13500,"OriginalStart":"175214","End":15600,"OriginalEnd":"204474","Description":"PUT \u003c(\"k7\"), (\"apple\")\u003e"},{"ClientId":0,"Start":13700,"OriginalStart":"178535","End":15200,"OriginalEnd":"199743","Description":"PUT \u003c(\"k3\"), (\"olive\")\u003e"},{"ClientId":5,"Start":13900,"OriginalStart":"179906","End":15400,"OriginalEnd":"201063","Description":"GET (\"k2\")→\"NotFound\""},{"ClientId":6,"Start":14100,"OriginalStart":"183160","End":14200,"OriginalEnd":"186994","Description":"GET (\"k1\")→\"cherry\""},{"ClientId":4,"Start":14400,"OriginalStart":"187994","End":16400,"OriginalEnd":"210237","Description":"DELETE \u003c(\"k1\"), (\"\")\u003e"},{"ClientId":6,"Start":14500,"OriginalStart":"188930","End":16000,"OriginalEnd":"207974","Description":"GET (\"k4\")→\"mango\""},{"ClientId":7,"Start":14700,"OriginalStart":"190785","End":17200,"OriginalEnd":"218910","Description":"GET (\"k8\")→\"olive\""},{"ClientId":1,"Start":15000,"OriginalStart":"196999","End":16700,"OriginalEnd":"215812","Description":"PUT \u003c(\"k5\"), (\"ham\")\u003e"},{"ClientId":3,"Start":15100,"OriginalStart":"197593","End":17100,"OriginalEnd":"218036","Description":"GET (\"k6\")→\"NotFound\""},{"ClientId":0,"Start":15300,"OriginalStart":"200743","End":15700,"OriginalEnd":"204964","Description":"GET (\"k3\")→\"olive\""},{"ClientId":5,"Start":15500,"OriginalStart":"202063","End":16100,"OriginalEnd":"208885","Description":"PUT \u003c(\"k2\"), (\"cherry\")\u003e"},{"ClientId":0,"Start":15800,"OriginalStart":"205474","End":17900,"OriginalEnd":"228247","Description":"DELETE \u003c(\"k7\"), (\"\")\u003e"},{"ClientId":2,"Start":15900,"OriginalStart":"205964","End":18300,"OriginalEnd":"236355","Description":"GET (\"k3\")→\"olive\""},{"ClientId":5,"Start":16200,"OriginalStart":"208974","End":16800,"OriginalEnd":"216076","Description":"GET (\"k4\")→\"mango\""},{"ClientId":6,"Start":16300,"OriginalStart":"209885","End":18100,"OriginalEnd":"236014","Description":"GET (\"k2\")→\"cherry\""},{"ClientId":4,"Start":16500,"OriginalStart":"211237","End":16600,"OriginalEnd":"215588","Description":"GET (\"k1\")→\"NotFound\""},{"ClientId":1,"Start":16900,"OriginalStart":"216812","End":17600,"OriginalEnd":"223289","Description":"PUT \u003c(\"k5\"), (\"kiwi\")\u003e"},{"ClientId":4,"Start":17000,"OriginalStart":"217076","End":18900,"OriginalEnd":"240778","Description":"GET (\"k4\")→\"mango\""},{"ClientId":3,"Start":17300,"OriginalStart":"219036","End":17500,"OriginalEnd":"222407","Description":"PUT \u003c(\"k6\"), (\"mango\")\u003e"},{"ClientId":5,"Start":17400,"OriginalStart":"219910","End":18700,"OriginalEnd":"238953","Description":"GET (\"k8\")→\"olive\""},{"ClientId":1,"Start":17700,"OriginalStart":"223407","End":19600,"OriginalEnd":"247492","Description":"PUT \u003c(\"k6\"), (\"cherry\")\u003e"},{"ClientId":3,"Start":17800,"OriginalStart":"224289","End":19900,"OriginalEnd":"256008","Description":"PUT \u003c(\"k5\"), (\"grape\")\u003e"},{"ClientId":0,"Start":18000,"OriginalStart":"229247","End":18200,"OriginalEnd":"236048","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":0,"Start":18400,"OriginalStart":"237014","End":19100,"OriginalEnd":"242502","Description":"GET (\"k2\")→\"cherry\""},{"ClientId":2,"Start":18500,"OriginalStart":"237048","End":20200,"OriginalEnd":"264976","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":6,"Start":18600,"OriginalStart":"237355","End":19200,"OriginalEnd":"243554","Description":"GET (\"k3\")→\"olive\""},{"ClientId":5,"Start":18800,"OriginalStart":"239953","End":19300,"OriginalEnd":"244878","Description":"GET (\"k8\")→\"olive\""},{"ClientId":4,"Start":19000,"OriginalStart":"241778","End":19400,"OriginalEnd":"245082","Description":"GET (\"k4\")→\"mango\""},{"ClientId":0,"Start":19500,"OriginalStart":"245878","End":20400,"OriginalEnd":"272372","Description":"GET (\"k8\")→\"olive\""},{"ClientId":1,"Start":19700,"OriginalStart":"248492","End":19800,"OriginalEnd":"253790","Description":"GET (\"k6\")→\"cherry\""},{"ClientId":1,"Start":20000,"OriginalStart":"257008","End":20100,"OriginalEnd":"260505","Description":"GET (\"k5\")→\"grape\""},{"ClientId":1,"Start":20300,"OriginalStart":"265976","End":20500,"OriginalEnd":"272480","Description":"GET (\"k7\")→\"NotFound\""},{"ClientId":0,"Start":20600,"OriginalStart":"273372","End":20700,"OriginalEnd":"277488","Description":"GET (\"k8\")→\"olive\""}],"PartialLinearizations":[[{"Index":0,"StateDescription":"{k1:elder}"},{"Index":1,"StateDescription":"{k1:elder}"},{"Index":2,"StateDescription":"{k1:elder}"},{"Index":3,"StateDescription":"{k1:elder}"},{"Index":4,"StateDescription":"{k1:elder, k2:kiwi}"},{"Index":5,"StateDescription":"{k1:elder, k2:kiwi}"},{"Index":6,"StateDescription":"{k1:elder, k2:kiwi, k3:olive}"},{"Index":7,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango}"},{"Index":8,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango}"},{"Index":9,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango}"},{"Index":10,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango, k5:elder}"},{"Index":11,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango, k5:elder}"},{"Index":12,"StateDescription":"{k1:elder, k2:kiwi, k3:olive, k4:mango, k5:elder}"},{"Index":13,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder}"},{"Index":14,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder}"},{"Index":15,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry}"},{"Index":16,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry, k7:nectar}"},{"Index":17,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry, k7:nectar, k8:grape}"},{"Index":18,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry, k7:nectar, k8:grape}"},{"Index":19,"StateDescription":"{k1:elder, k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry, k7:nectar, k8:olive}"},{"Index":20,"StateDescription":"{k2:olive, k3:olive, k4:mango, k5:elder, k6:cherry, k7:nectar, k8:olive}"},{"Index":21,"StateDescription":"{k2:olive, k3:olive, k4:mango, k5:apple, k6:cherry, k7:nectar, k8:olive}"},{"Index":22,"StateDescription":"{k2:olive, k3:olive, k4:mango, k5:apple, k7:nectar, k8:olive}"},{"Index":23,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:apple, k7:nectar, k8:olive}"},{"Index":24,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:apple, k8:olive}"},{"Index":25,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:apple, k8:olive}"},{"Index":26,"StateDescription":"{k1:banana, k2:olive, k3:peach, k4:mango, k5:apple, k8:olive}"},{"Index":27,"StateDescription":"{k1:banana, k2:olive, k3:peach, k4:mango, k5:apple, k8:peach}"},{"Index":28,"StateDescription":"{k1:banana, k2:olive, k3:peach, k4:mango, k5:apple, k8:peach}"},{"Index":29,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:apple, k8:peach}"},{"Index":30,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:jam, k8:peach}"},{"Index":31,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:jam, k8:peach}"},{"Index":32,"StateDescription":"{k2:olive, k3:peach, k4:mango, k5:jam, k8:peach}"},{"Index":33,"StateDescription":"{k2:olive, k3:elder, k4:mango, k5:jam, k8:peach}"},{"Index":34,"StateDescription":"{k2:olive, k3:elder, k4:mango, k5:jam, k7:lemon, k8:peach}"},{"Index":35,"StateDescription":"{k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:peach}"},{"Index":36,"StateDescription":"{k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:peach}"},{"Index":37,"StateDescription":"{k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:peach}"},{"Index":38,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:peach}"},{"Index":39,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:ham}"},{"Index":40,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k5:jam, k6:mango, k7:lemon, k8:ham}"},{"Index":41,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:mango, k7:lemon, k8:ham}"},{"Index":42,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:mango, k7:lemon, k8:ham}"},{"Index":43,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:grape, k7:lemon, k8:ham}"},{"Index":44,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:grape, k8:ham}"},{"Index":45,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:grape, k8:ham}"},{"Index":46,"StateDescription":"{k1:cherry, k2:olive, k3:elder, k4:mango, k6:fig, k8:ham}"},{"Index":47,"StateDescription":"{k1:cherry, k2:olive, k3:mango, k4:mango, k6:fig, k8:ham}"},{"Index":48,"StateDescription":"{k1:cherry, k2:olive, k3:mango, k4:mango, k6:fig, k8:ham}"},{"Index":49,"StateDescription":"{k1:cherry, k2:olive, k3:mango, k4:mango, k6:fig, k8:ham}"},{"Index":50,"StateDescription":"{k1:cherry, k2:cherry, k3:mango, k4:mango, k6:fig, k8:ham}"},{"Index":51,"StateDescription":"{k1:cherry, k2:cherry, k3:mango, k4:mango, k6:fig, k8:ice}"},{"Index":52,"StateDescription":"{k1:cherry, k2:cherry, k3:mango, k4:mango, k6:fig, k8:ice}"},{"Index":53,"StateDescription":"{k1:cherry, k2:peach, k3:mango, k4:mango, k6:fig, k8:ice}"},{"Index":54,"StateDescription":"{k1:cherry, k2:peach, k3:mango, k4:mango, k6:fig}"},{"Index":55,"StateDescription":"{k1:cherry, k2:peach, k3:mango, k4:mango, k6:fig}"},{"Index":56,"StateDescription":"{k1:cherry, k2:peach, k3:mango, k4:mango, k6:fig}"},{"Index":57,"StateDescription":"{k1:cherry, k2:peach, k3:mango, k4:mango, k6:fig}"},{"Index":58,"StateDescription":"{k1:cherry, k2:peach, k4:mango, k6:fig}"},{"Index":59,"StateDescription":"{k1:cherry, k2:peach, k4:mango, k6:fig}"},{"Index":60,"StateDescription":"{k1:cherry, k2:peach, k4:mango, k6:fig}"},{"Index":61,"StateDescription":"{k1:cherry, k2:peach, k4:mango, k5:lemon, k6:fig}"},{"Index":62,"StateDescription":"{k1:cherry, k2:peach, k4:mango, k5:lemon, k6:cherry}"},{"Index":63,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k6:cherry}"},{"Index":64,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k6:cherry, k7:elder}"},{"Index":65,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k6:cherry, k7:elder}"},{"Index":66,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k6:cherry, k7:elder}"},{"Index":67,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k6:cherry, k7:elder}"},{"Index":68,"StateDescription":"{k1:cherry, k4:mango, k5:lemon, k7:elder}"},{"Index":69,"StateDescription":"{k1:cherry, k4:mango, k7:elder}"},{"Index":70,"StateDescription":"{k1:cherry, k4:mango, k7:elder, k8:olive}"},{"Index":71,"StateDescription":"{k1:cherry, k4:mango, k7:apple, k8:olive}"},{"Index":72,"StateDescription":"{k1:cherry, k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":73,"StateDescription":"{k1:cherry, k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":74,"StateDescription":"{k1:cherry, k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":75,"StateDescription":"{k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":76,"StateDescription":"{k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":77,"StateDescription":"{k3:olive, k4:mango, k7:apple, k8:olive}"},{"Index":78,"StateDescription":"{k3:olive, k4:mango, k5:ham, k7:apple, k8:olive}"},{"Index":79,"StateDescription":"{k3:olive, k4:mango, k5:ham, k7:apple, k8:olive}"},{"Index":80,"StateDescription":"{k3:olive, k4:mango, k5:ham, k7:apple, k8:olive}"},{"Index":81,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k7:apple, k8:olive}"},{"Index":82,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k8:olive}"},{"Index":83,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k8:olive}"},{"Index":84,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k8:olive}"},{"Index":85,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k8:olive}"},{"Index":86,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:ham, k8:olive}"},{"Index":87,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:kiwi, k8:olive}"},{"Index":88,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:kiwi, k8:olive}"},{"Index":89,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:kiwi, k6:mango, k8:olive}"},{"Index":90,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:kiwi, k6:mango, k8:olive}"},{"Index":91,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:kiwi, k6:cherry, k8:olive}"},{"Index":92,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":93,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":94,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":95,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":96,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":97,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":98,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":99,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":100,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":101,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":102,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"},{"Index":103,"StateDescription":"{k2:cherry, k3:olive, k4:mango, k5:grape, k6:cherry, k8:olive}"}]],"Largest":{"0":0,"1":0,"10":0,"100":0,"101":0,"102":0,"103":0,"11":0,"12":0,"13":0,"14":0,"15":0,"16":0,"17":0,"18":0,"19":0,"2":0,"20":0,"21":0,"22":0,"23":0,"24":0,"25":0,"26":0,"27":0,"28":0,"29":0,"3":0,"30":0,"31":0,"32":0,"33":0,"34":0,"35":0,"36":0,"37":0,"38":0,"39":0,"4":0,"40":0,"41":0,"42":0,"43":0,"44":0,"45":0,"46":0,"47":0,"48":0,"49":0,"5":0,"50":0,"51":0,"52":0,"53":0,"54":0,"55":0,"56":0,"57":0,"58":0,"59":0,"6":0,"60":0,"61":0,"62":0,"63":0,"64":0,"65":0,"66":0,"67":0,"68":0,"69":0,"7":0,"70":0,"71":0,"72":0,"73":0,"74":0,"75":0,"76":0,"77":0,"78":0,"79":0,"8":0,"80":0,"81":0,"82":0,"83":0,"84":0,"85":0,"86":0,"87":0,"88":0,"89":0,"9":0,"90":0,"91":0,"92":0,"93":0,"94":0,"95":0,"96":0,"97":0,"98":0,"99":0}}],"Annotations":[]}
+
+      render(data)
+    </script>
+  </body>
+</html>
